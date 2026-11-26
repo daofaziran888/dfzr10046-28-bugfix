@@ -59,3 +59,76 @@ export async function loadOverview(): Promise<OverviewResult> {
   if (!response.ok) throw new Error('运营概览读取失败')
   return await response.json()
 }
+
+export type ChainCandidate = {
+  chain_id: string
+  surrogate_key: string
+  status: string
+  interval: string
+  is_current: string
+  orderable: boolean
+  active_order: string | null
+}
+
+export type ExcludedChain = {
+  chain_id: string
+  status: string
+  interval: string
+  reason: string
+}
+
+export type SnapshotOrder = {
+  order_id: string
+  snapshot_id: string
+  chain_id: string
+  dim_name: string
+  interval: string
+  status: string
+  accepted_at: string
+  return_reason: string
+  source_status?: string
+  can_confirm?: boolean
+  return_to_chain?: string
+}
+
+export type SnapshotBoard = {
+  snapshot: EntryRow
+  candidates: ChainCandidate[]
+  excluded: ExcludedChain[]
+  orders: SnapshotOrder[]
+}
+
+export async function loadSnapshotBoard(): Promise<{ boards: SnapshotBoard[] }> {
+  const response = await request('/api/dim_snapshot/board')
+  if (!response.ok) throw new Error('快照操作台读取失败')
+  return await response.json()
+}
+
+export async function acceptSnapshotOrder(
+  snapshotId: string,
+  chainId: string,
+): Promise<ActionResult> {
+  const response = await request('/api/dim_snapshot/orders', {
+    method: 'POST',
+    body: JSON.stringify({ snapshot_id: snapshotId, chain_id: chainId }),
+  })
+  return await response.json()
+}
+
+export async function confirmSnapshotOrder(orderId: string): Promise<ActionResult> {
+  const response = await request(`/api/dim_snapshot/orders/${orderId}/confirm`, {
+    method: 'POST',
+  })
+  return await response.json()
+}
+
+export async function rejectSnapshotOrder(
+  orderId: string,
+  reason = '操作者退回重选',
+): Promise<ActionResult> {
+  const response = await request(`/api/dim_snapshot/orders/${orderId}/reject`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  })
+  return await response.json()
+}

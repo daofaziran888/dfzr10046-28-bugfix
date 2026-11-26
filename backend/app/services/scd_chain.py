@@ -16,49 +16,94 @@ class ScdChainService(BaseModuleService):
     STATUS_ORDER = ["加工中", "已闭链", "区间冲突", "已作废"]
     ACTION_RULES = {"闭链记录": "已闭链", "标记冲突": "区间冲突", "作废记录": "已作废"}
     NEGATIVE_ACTIONS = ["作废记录"]
+    # 作废为终态：作废生效后旧页面持有的任何动作入口都不得复活该记录
+    TERMINAL_STATUSES = ["已作废"]
+
+    def allowed_actions(self, entry: dict[str, Any]) -> list[str]:
+        """拉链动作资格：加工中可闭链/标冲突/作废；冲突可闭链/作废；已闭链仅可作废。"""
+        if entry is None or entry.get("status") in self.TERMINAL_STATUSES:
+            return []
+        status = entry.get("status")
+        if status == "加工中":
+            return ["闭链记录", "标记冲突", "作废记录"]
+        if status == "区间冲突":
+            return ["闭链记录", "作废记录"]
+        if status == "已闭链":
+            return ["作废记录"]
+        return []
+
+    def _find_by_chain_id(self, chain_id: str) -> dict[str, Any] | None:
+        for row in store.rows(self.MODULE):
+            if row.get("拉链编号") == chain_id:
+                return row
+        return None
+
+    def _apply_action(
+        self, entry: dict[str, Any], action: str, remark: str | None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        if action == "闭链记录":
+            # 通用动作入口承载闭链参数：remark 作为生效止日，日期非法时保持原状态
+            end_date = (remark or "").strip() or str(date.today().isoformat())
+            ok, message, updated = self.close_chain_record(
+                entry.get("拉链编号", ""), end_date, entry.get("链上前序") or None,
+            )
+            return (updated, message) if ok else (None, message)
+        if action == "作废记录":
+            entry["status"] = "已作废"
+            entry["pending"] = False
+            entry["abnormal"] = True
+            entry["是否当前"] = "否"
+            # 作废生效后，同步通知维度快照：引用该链的在途开单必须退回，候选清单同步剔除
+            from app.services.dim_snapshot import DimSnapshotService
+            DimSnapshotService().invalidate_chain(entry.get("拉链编号", ""))
+            return entry, f"拉链记录已{action}"
+        # 标记冲突
+        entry["status"] = "区间冲突"
+        entry["pending"] = False
+        entry["abnormal"] = True
+        if remark:
+            entry["冲突原因"] = remark
+        return entry, f"拉链记录已{action}"
 
     def close_chain_record(
         self, chain_id: str, end_date: str, predecessor_id: str | None = None,
     ) -> tuple[bool, str, dict[str, Any] | None]:
-        """闭链操作：校验起止日期与链上前序收敛条件。"""
-        rows = store.rows(self.MODULE)
-        target = None
-        for r in rows:
-            if r.get("拉链编号") == chain_id:
-                target = r
-                break
-        if target is None:
-            return False, f"拉链 {chain_id} 不存在", None
+        """闭链操作：先过动作资格，再校验起止日期与链上前序收敛条件。"""
+        with self._action_lock:
+            target = self._find_by_chain_id(chain_id)
+            if target is None:
+                return False, f"拉链 {chain_id} 不存在", None
+            # 与页面、通用动作接口同一资格判定：已作废/已闭链均不得再闭链
+            eligible, reason = self.can_run_action(target, "闭链记录")
+            if not eligible:
+                return False, reason, None
 
-        try:
-            end_dt = date.fromisoformat(end_date)
-            start_dt = date.fromisoformat(target.get("生效起日", end_date))
-        except ValueError:
-            return False, f"日期格式无效", None
+            try:
+                end_dt = date.fromisoformat(end_date)
+                start_dt = date.fromisoformat(target.get("生效起日", end_date))
+            except ValueError:
+                return False, "日期格式无效", None
 
-        if end_dt < start_dt:
-            return False, f"生效止日 {end_date} 早于生效起日 {target.get('生效起日')}", None
+            if end_dt < start_dt:
+                return False, f"生效止日 {end_date} 早于生效起日 {target.get('生效起日')}", None
 
-        if predecessor_id:
-            pred = None
-            for r in rows:
-                if r.get("拉链编号") == predecessor_id:
-                    pred = r
-                    break
-            if pred is None:
-                return False, f"链上前序 {predecessor_id} 不存在", None
-            pred_end = pred.get("生效止日", "")
-            if pred_end != target.get("生效起日", ""):
-                return False, (
-                    f"前序止日 {pred_end} 与当前起日 {target.get('生效起日')} 不首尾相接"
-                ), None
-            target["链上前序"] = predecessor_id
+            if predecessor_id:
+                pred = self._find_by_chain_id(predecessor_id)
+                if pred is None:
+                    return False, f"链上前序 {predecessor_id} 不存在", None
+                pred_end = pred.get("生效止日", "")
+                if pred_end != target.get("生效起日", ""):
+                    return False, (
+                        f"前序止日 {pred_end} 与当前起日 {target.get('生效起日')} 不首尾相接"
+                    ), None
+                target["链上前序"] = predecessor_id
 
-        target["生效止日"] = end_date
-        target["是否当前"] = "否"
-        target["status"] = "已闭链"
-        target["pending"] = False
-        return True, f"拉链 {chain_id} 已闭链至 {end_date}", dict(target)
+            target["生效止日"] = end_date
+            target["是否当前"] = "否"
+            target["status"] = "已闭链"
+            target["pending"] = False
+            target["abnormal"] = False
+            return True, f"拉链 {chain_id} 已闭链至 {end_date}", dict(target)
 
     def detect_overlap_conflicts(self, dim_name: str) -> list[dict[str, Any]]:
         """检测指定维度下的拉链区间重叠冲突。"""
@@ -89,15 +134,18 @@ class ScdChainService(BaseModuleService):
         return conflicts
 
     def mark_conflict(self, chain_id: str, reason: str) -> bool:
-        """标记拉链记录为区间冲突状态。"""
-        rows = store.rows(self.MODULE)
-        for r in rows:
-            if r.get("拉链编号") == chain_id:
-                r["status"] = "区间冲突"
-                r["abnormal"] = True
-                r["冲突原因"] = reason
-                return True
-        return False
+        """标记拉链记录为区间冲突状态；已作废记录不接受标记。"""
+        with self._action_lock:
+            target = self._find_by_chain_id(chain_id)
+            if target is None:
+                return False
+            eligible, _ = self.can_run_action(target, "标记冲突")
+            if not eligible:
+                return False
+            target["status"] = "区间冲突"
+            target["abnormal"] = True
+            target["冲突原因"] = reason
+            return True
 
     def apply_attr_invalidation(
         self, dim_name: str, attr_name: str, default_value: str,

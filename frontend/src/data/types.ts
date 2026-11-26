@@ -5,7 +5,8 @@ export type EntryRow = {
   status: string
   pending: boolean
   abnormal: boolean
-  [field: string]: string | number | boolean
+  eligible_actions?: string[]
+  [field: string]: string | number | boolean | string[] | undefined
 }
 
 export type ModuleMeta = {

@@ -51,7 +51,7 @@
           <td>{{ row.status }}</td>
           <td class="row-actions">
             <button
-              v-for="action in meta.actions"
+              v-for="action in eligibleActions(row)"
               :key="action"
               class="link"
               type="button"
@@ -60,6 +60,9 @@
             >
               {{ action }}
             </button>
+            <span v-if="!eligibleActions(row).length" class="muted-text" data-testid="no-eligible-action">
+              无可执行动作
+            </span>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -167,6 +170,11 @@ async function submitCreate() {
 
 async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
+  // 与接口同一套动作资格：旧窗口里的失效入口在提交前直接拦下，避免终态记录被复活
+  if (!eligibleActions(row).includes(action)) {
+    errorMessage.value = `记录当前状态为「${row.status}」，不具备动作「${action}」资格，请刷新后重试`
+    return
+  }
   try {
     const result = await applyAction(meta.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
@@ -174,6 +182,13 @@ async function runAction(action: string, row: EntryRow) {
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
   }
+}
+
+function eligibleActions(row: EntryRow): string[] {
+  // 以后端下发的动作资格为准；旧数据缺失字段时退回模块动作清单，由接口兜底校验
+  const fromServer = row.eligible_actions
+  if (Array.isArray(fromServer)) return fromServer
+  return meta.actions.filter((action) => meta.actionTargets[action] !== row.status)
 }
 
 async function reload() {
@@ -189,3 +204,10 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.muted-text {
+  color: var(--muted);
+  font-size: 12px;
+}
+</style>
